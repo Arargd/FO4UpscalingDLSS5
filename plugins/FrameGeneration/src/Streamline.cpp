@@ -18,6 +18,7 @@ void StreamlineFG::LoadInterposer()
 	slSetTagForFrame = (PFun_slSetTagForFrame2*)GetProcAddress(interposer, "slSetTagForFrame");
 	slSetConstants = (PFun_slSetConstants*)GetProcAddress(interposer, "slSetConstants");
 	slGetNewFrameToken = (PFun_slGetNewFrameToken*)GetProcAddress(interposer, "slGetNewFrameToken");
+	slEvaluateFeature = (PFun_slEvaluateFeature*)GetProcAddress(interposer, "slEvaluateFeature");
 }
 
 bool StreamlineFG::InitStreamline()
@@ -28,6 +29,7 @@ bool StreamlineFG::InitStreamline()
 
 	// Pre-load plugin DLLs for MO2 USVFS compatibility
 	LoadLibrary(L"Data\\F4SE\\Plugins\\Streamline\\sl.common.dll");
+	LoadLibrary(L"Data\\F4SE\\Plugins\\Streamline\\sl.dlss.dll");
 	LoadLibrary(L"Data\\F4SE\\Plugins\\Streamline\\sl.dlss_g.dll");
 
 	sl::Preferences pref{};
@@ -41,7 +43,8 @@ bool StreamlineFG::InitStreamline()
 	}
 	pref.engine = sl::EngineType::eCustom;
 	pref.engineVersion = "1.0.0";
-	pref.projectId = "f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4f4";
+	// Reuse the project ID already used by this repo's D3D11 DLSS integration.
+	pref.projectId = "f8776929-c969-43bd-ac2b-294b4de58aac";
 	pref.flags = sl::PreferenceFlags::eUseManualHooking | sl::PreferenceFlags::eUseFrameBasedResourceTagging;
 	pref.renderAPI = sl::RenderAPI::eD3D12;
 
@@ -56,7 +59,7 @@ bool StreamlineFG::InitStreamline()
 	pref.pathsToPlugins = pluginPaths;
 	pref.numPathsToPlugins = 1;
 
-	static sl::Feature features[] = { sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
+	static sl::Feature features[] = { sl::kFeatureDLSS, sl::kFeatureDLSS_G, sl::kFeatureReflex, sl::kFeaturePCL };
 	pref.featuresToLoad = features;
 	pref.numFeaturesToLoad = _countof(features);
 
@@ -81,9 +84,28 @@ void StreamlineFG::SetD3DDevice(ID3D12Device* a_device)
 	}
 }
 
+bool StreamlineFG::CheckAndEnableDLSSProbe()
+{
+	if (!slInitialized || !slGetFeatureFunction || !slEvaluateFeature) return false;
+
+	slGetFeatureFunction(sl::kFeatureDLSS, "slDLSSSetOptions", (void*&)slDLSSSetOptions);
+	if (!slDLSSSetOptions) {
+		REX::WARN("[DLSS-NR-PROBE] Could not resolve slDLSSSetOptions");
+		featureDLSS = false;
+		return false;
+	}
+
+	featureDLSS = true;
+	REX::INFO("[DLSS-NR-PROBE] D3D12 DLSS feature function resolved; probe enabled");
+	return true;
+}
+
 bool StreamlineFG::CheckAndEnableDLSSG()
 {
 	if (!slInitialized) return false;
+
+	// Probe DLSS is optional: DLSS-G may still work if this fails.
+	CheckAndEnableDLSSProbe();
 
 	if (slGetFeatureFunction) {
 		slGetFeatureFunction(sl::kFeatureDLSS_G, "slDLSSGSetOptions", (void*&)slDLSSGSetOptions);
@@ -176,7 +198,7 @@ static sl::float3 toSLFloat3(const __m128* v)
 
 void StreamlineFG::AcquireFrameToken()
 {
-	if (!slGetNewFrameToken || !featureDLSSG) return;
+	if (!slGetNewFrameToken || (!featureDLSSG && !featureDLSS)) return;
 
 	if (SL_FAILED(res, slGetNewFrameToken(frameToken, nullptr))) {
 		static bool loggedOnce = false;
@@ -188,6 +210,116 @@ void StreamlineFG::SetPCLMarker(sl::PCLMarker marker)
 {
 	if (!slReflexSetMarker || !frameToken) return;
 	slReflexSetMarker(marker, *frameToken);
+}
+
+bool StreamlineFG::RunDLSSProbe(
+	ID3D12GraphicsCommandList* a_cmdList,
+	ID3D12Resource* a_depth,
+	ID3D12Resource* a_motionVectors,
+	ID3D12Resource* a_color,
+	float2 a_screenSize)
+{
+	if (!dlssProbeEnabled || !featureDLSS || !frameToken || !slDLSSSetOptions || !slEvaluateFeature ||
+		!d3d12Device || !a_cmdList || !a_depth || !a_motionVectors || !a_color)
+		return false;
+
+	auto inputDesc = a_color->GetDesc();
+	const uint32_t width = (uint32_t)a_screenSize.x;
+	const uint32_t height = (uint32_t)a_screenSize.y;
+
+	// Create/recreate a full-resolution UAV-capable scratch output. Keeping it separate
+	// from the input avoids relying on in-place DLSS behavior and makes this a valid
+	// D3D12 DLAA evaluation for hook/probe purposes.
+	if (!dlssProbeOutput || dlssProbeWidth != width || dlssProbeHeight != height || dlssProbeFormat != inputDesc.Format) {
+		if (dlssProbeOutput) {
+			dlssProbeOutput->Release();
+			dlssProbeOutput = nullptr;
+		}
+
+		D3D12_HEAP_PROPERTIES heapProps{};
+		heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+		heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+		heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+		heapProps.CreationNodeMask = 1;
+		heapProps.VisibleNodeMask = 1;
+
+		D3D12_RESOURCE_DESC outDesc = inputDesc;
+		outDesc.Width = width;
+		outDesc.Height = height;
+		outDesc.MipLevels = 1;
+		outDesc.DepthOrArraySize = 1;
+		outDesc.SampleDesc.Count = 1;
+		outDesc.SampleDesc.Quality = 0;
+		outDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		outDesc.Flags = (D3D12_RESOURCE_FLAGS)(outDesc.Flags | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+
+		HRESULT hr = d3d12Device->CreateCommittedResource(
+			&heapProps,
+			D3D12_HEAP_FLAG_NONE,
+			&outDesc,
+			D3D12_RESOURCE_STATE_COMMON,
+			nullptr,
+			IID_PPV_ARGS(&dlssProbeOutput));
+		if (FAILED(hr)) {
+			REX::ERROR("[DLSS-NR-PROBE] Failed to create scratch output: {:#x}", (uint32_t)hr);
+			return false;
+		}
+
+		dlssProbeWidth = width;
+		dlssProbeHeight = height;
+		dlssProbeFormat = inputDesc.Format;
+		REX::INFO("[DLSS-NR-PROBE] Scratch output created: {}x{}, format={}", width, height, (int)inputDesc.Format);
+	}
+
+	sl::DLSSOptions options{};
+	options.mode = sl::DLSSMode::eDLAA;
+	options.outputWidth = width;
+	options.outputHeight = height;
+	options.colorBuffersHDR = sl::Boolean::eFalse;
+	if (SL_FAILED(setResult, slDLSSSetOptions(viewport, options))) {
+		static bool loggedSetFailure = false;
+		if (!loggedSetFailure) {
+			REX::ERROR("[DLSS-NR-PROBE] slDLSSSetOptions failed: {}", (int)setResult);
+			loggedSetFailure = true;
+		}
+		return false;
+	}
+
+	sl::Extent extent{ 0, 0, width, height };
+	sl::Resource colorIn = { sl::ResourceType::eTex2d, a_color, 0 };
+	sl::Resource colorOut = { sl::ResourceType::eTex2d, dlssProbeOutput, 0 };
+	sl::Resource depth = { sl::ResourceType::eTex2d, a_depth, 0 };
+	sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectors, 0 };
+
+	sl::ResourceTag tags[] = {
+		{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &extent },
+		{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &extent },
+		{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent },
+		{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent },
+	};
+
+	if (slSetTagForFrame) {
+		auto tagResult = slSetTagForFrame(*frameToken, viewport, tags, _countof(tags), (sl::CommandBuffer*)a_cmdList);
+		if (tagResult != sl::Result::eOk) {
+			static bool loggedTagFailure = false;
+			if (!loggedTagFailure) {
+				REX::ERROR("[DLSS-NR-PROBE] slSetTagForFrame failed: {}", (int)tagResult);
+				loggedTagFailure = true;
+			}
+			return false;
+		}
+	}
+
+	sl::ViewportHandle view(viewport);
+	const sl::BaseStructure* inputs[] = { &view };
+	auto result = slEvaluateFeature(sl::kFeatureDLSS, *frameToken, inputs, _countof(inputs), (sl::CommandBuffer*)a_cmdList);
+
+	static bool loggedEval = false;
+	if (!loggedEval) {
+		REX::INFO("[DLSS-NR-PROBE] First D3D12 DLSS/DLAA evaluation result: {}", (int)result);
+		loggedEval = true;
+	}
+	return result == sl::Result::eOk;
 }
 
 void StreamlineFG::Present(
@@ -277,10 +409,19 @@ void StreamlineFG::Present(
 			slSetTagForFrame(*frameToken, viewport, tags, _countof(tags), (sl::CommandBuffer*)a_cmdList);
 		}
 	}
+
+	// Experimental D3D12 DLAA dispatch. The scratch output is not presented yet;
+	// this build exists to verify that D3D12 DLSS is visible to the Neural Rendering addon.
+	RunDLSSProbe(a_cmdList, a_depth, a_motionVectors, a_hudlessColor, a_screenSize);
 }
 
 void StreamlineFG::Shutdown()
 {
+	if (dlssProbeOutput) {
+		dlssProbeOutput->Release();
+		dlssProbeOutput = nullptr;
+	}
+
 	if (slInitialized && slShutdown) {
 		slShutdown();
 		slInitialized = false;
