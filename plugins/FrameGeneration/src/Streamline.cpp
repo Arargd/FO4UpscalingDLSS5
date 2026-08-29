@@ -271,20 +271,13 @@ bool StreamlineFG::RunDLSSProbe(
 		REX::INFO("[DLSS-NR-PROBE] Scratch output created: {}x{}, format={}", width, height, (int)inputDesc.Format);
 	}
 
-	sl::DLSSOptions options{};
-	options.mode = sl::DLSSMode::eDLAA;
-	options.outputWidth = width;
-	options.outputHeight = height;
-	options.colorBuffersHDR = sl::Boolean::eFalse;
-	if (SL_FAILED(setResult, slDLSSSetOptions(viewport, options))) {
-		static bool loggedSetFailure = false;
-		if (!loggedSetFailure) {
-			REX::ERROR("[DLSS-NR-PROBE] slDLSSSetOptions failed: {}", (int)setResult);
-			loggedSetFailure = true;
-		}
-		return false;
-	}
-
+	// IMPORTANT FOR THE NR ADDON:
+	// Tag the DLSS resources BEFORE slDLSSSetOptions. The experimental RenoDX
+	// NR addon observes DLSS setup/evaluation and looks the resources up through
+	// Streamline's global frame tags. In the first probe we called SetOptions
+	// first, which caused Streamline to report that ScalingInputColor was missing.
+	// Keep input/output alive through present as well so a post-DLSS addon can
+	// safely consume both textures after the game's DLSS evaluation.
 	sl::Extent extent{ 0, 0, width, height };
 	sl::Resource colorIn = { sl::ResourceType::eTex2d, a_color, 0 };
 	sl::Resource colorOut = { sl::ResourceType::eTex2d, dlssProbeOutput, 0 };
@@ -292,8 +285,8 @@ bool StreamlineFG::RunDLSSProbe(
 	sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectors, 0 };
 
 	sl::ResourceTag tags[] = {
-		{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eOnlyValidNow, &extent },
-		{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eOnlyValidNow, &extent },
+		{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilPresent, &extent },
+		{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent, &extent },
 		{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent },
 		{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent },
 	};
@@ -308,6 +301,20 @@ bool StreamlineFG::RunDLSSProbe(
 			}
 			return false;
 		}
+	}
+
+	sl::DLSSOptions options{};
+	options.mode = sl::DLSSMode::eDLAA;
+	options.outputWidth = width;
+	options.outputHeight = height;
+	options.colorBuffersHDR = sl::Boolean::eFalse;
+	if (SL_FAILED(setResult, slDLSSSetOptions(viewport, options))) {
+		static bool loggedSetFailure = false;
+		if (!loggedSetFailure) {
+			REX::ERROR("[DLSS-NR-PROBE] slDLSSSetOptions failed: {}", (int)setResult);
+			loggedSetFailure = true;
+		}
+		return false;
 	}
 
 	sl::ViewportHandle view(viewport);
