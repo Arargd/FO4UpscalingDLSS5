@@ -198,6 +198,9 @@ static sl::float3 toSLFloat3(const __m128* v)
 
 void StreamlineFG::AcquireFrameToken()
 {
+	// Never reuse a previous frame's DLSS output if this frame cannot evaluate.
+	dlssOutputValid = false;
+
 	if (!slGetNewFrameToken || (!featureDLSSG && !featureDLSS)) return;
 
 	if (SL_FAILED(res, slGetNewFrameToken(frameToken, nullptr))) {
@@ -219,6 +222,8 @@ bool StreamlineFG::RunDLSSProbe(
 	ID3D12Resource* a_color,
 	float2 a_screenSize)
 {
+	dlssOutputValid = false;
+
 	if (!dlssProbeEnabled || !featureDLSS || !frameToken || !slDLSSSetOptions || !slEvaluateFeature ||
 		!d3d12Device || !a_cmdList || !a_depth || !a_motionVectors || !a_color)
 		return false;
@@ -326,7 +331,16 @@ bool StreamlineFG::RunDLSSProbe(
 		REX::INFO("[DLSS-NR-PROBE] First D3D12 DLSS/DLAA evaluation result: {}", (int)result);
 		loggedEval = true;
 	}
-	return result == sl::Result::eOk;
+
+	dlssOutputValid = (result == sl::Result::eOk);
+	if (dlssOutputValid) {
+		static bool loggedVisualReady = false;
+		if (!loggedVisualReady) {
+			REX::INFO("[DLSS-NR-VISUAL] DLSS output is valid and ready for presentation");
+			loggedVisualReady = true;
+		}
+	}
+	return dlssOutputValid;
 }
 
 void StreamlineFG::Present(
@@ -417,13 +431,15 @@ void StreamlineFG::Present(
 		}
 	}
 
-	// Experimental D3D12 DLAA dispatch. The scratch output is not presented yet;
-	// this build exists to verify that D3D12 DLSS is visible to the Neural Rendering addon.
+	// Visual D3D12 DLAA dispatch. RenoDX hooks this evaluation and the resulting
+	// texture is copied to the swap chain later in DX12SwapChain::Present.
 	RunDLSSProbe(a_cmdList, a_depth, a_motionVectors, a_hudlessColor, a_screenSize);
 }
 
 void StreamlineFG::Shutdown()
 {
+	dlssOutputValid = false;
+
 	if (dlssProbeOutput) {
 		dlssProbeOutput->Release();
 		dlssProbeOutput = nullptr;

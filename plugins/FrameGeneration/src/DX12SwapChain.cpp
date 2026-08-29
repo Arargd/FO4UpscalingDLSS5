@@ -211,22 +211,21 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 {
 	auto upscalingForUI = Upscaling::GetSingleton();
 
-	// For DLSS-G: generate UI extraction buffer, then present the HUDLess (clean scene)
-	// to the swap chain instead of the full frame. DLSS-G warps whatever is in the swap chain,
-	// so presenting HUDLess prevents UI from being warped. UIColorAndAlpha tells DLSS-G
-	// to composite UI on top of both real and interpolated frames.
+	// For the NVIDIA D3D12 path: extract UI from the final D3D11 frame and stage the
+	// HUD-less scene. The staged HUD-less copy is the fallback source; the normal path
+	// runs DLSS/Neural Rendering on HUDLessBufferShared12 and presents that result instead.
 	if (upscalingForUI->activeFrameGenType == Upscaling::FrameGenType::kDLSSG &&
 		upscalingForUI->setupBuffers && upscalingForUI->imagespaceComplete)
 	{
 		upscalingForUI->GenerateUIBuffer();
 
-		// Copy HUDLess (clean scene, no UI) to the D3D12 swap chain — NOT the proxy backbuffer
+		// Stage HUDLess (clean scene, no UI) in the D3D11/D3D12 interop texture.
 		d3d11Context->CopyResource(swapChainBufferWrapped[frameIndex]->resource11,
 			upscalingForUI->HUDLessBufferShared[frameIndex]->resource.get());
 
 		static bool loggedOnce = false;
 		if (!loggedOnce) {
-			REX::INFO("[FG] DLSS-G: presenting HUDLess to swap chain, UI composited via D3D12 compositor");
+			REX::INFO("[DLSS-NR-VISUAL] HUD-less scene staged; UI extracted for post-DLSS composition");
 			loggedOnce = true;
 		}
 	}
@@ -247,26 +246,6 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 	// New frame, reset
 	DX::ThrowIfFailed(commandAllocators[frameIndex]->Reset());
 	DX::ThrowIfFailed(commandLists[frameIndex]->Reset(commandAllocators[frameIndex].get(), nullptr));
-
-	// Transfer frame to swap chain buffer
-	{
-		auto srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
-		auto dstResource = swapChainBuffers[frameIndex].get();
-
-		D3D12_RESOURCE_BARRIER barriers[2] = {
-			CD3DX12_RESOURCE_BARRIER::Transition(srcResource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
-			CD3DX12_RESOURCE_BARRIER::Transition(dstResource, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
-		};
-		commandLists[frameIndex]->ResourceBarrier(2, barriers);
-
-		commandLists[frameIndex]->CopyResource(dstResource, srcResource);
-
-		D3D12_RESOURCE_BARRIER postBarriers[2] = {
-			CD3DX12_RESOURCE_BARRIER::Transition(srcResource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
-			CD3DX12_RESOURCE_BARRIER::Transition(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
-		};
-		commandLists[frameIndex]->ResourceBarrier(2, postBarriers);
-	}
 
 	auto upscaling = Upscaling::GetSingleton();
 	upscaling->ReloadSettingsIfNeeded();
@@ -359,6 +338,48 @@ HRESULT DX12SwapChain::Present(UINT SyncInterval, UINT Flags)
 		}
 	} else {
 		FidelityFX::GetSingleton()->Present(useFrameGenerationThisFrame);
+	}
+
+	// Present the scene only AFTER the DLSS/DLAA evaluation above has been recorded.
+	// When RenoDX Neural Rendering is active, GetDLSSOutput() is the processed scene.
+	// The real swap-chain Present hook composites UIColorAlpha on top afterwards, so
+	// the HUD/menu stays unprocessed and crisp. If DLSS fails for a frame, fall back
+	// to the original HUD-less scene already copied into swapChainBufferWrapped.
+	{
+		ID3D12Resource* srcResource = swapChainBufferWrapped[frameIndex]->resource.get();
+		bool usingNeuralDLSS = false;
+
+		if (isDLSSGFrame && upscaling->setupBuffers && upscaling->imagespaceComplete) {
+			auto dlss = StreamlineFG::GetSingleton();
+			if (auto dlssOutput = dlss->GetDLSSOutput()) {
+				srcResource = dlssOutput;
+				usingNeuralDLSS = true;
+			}
+		}
+
+		auto dstResource = swapChainBuffers[frameIndex].get();
+
+		D3D12_RESOURCE_BARRIER barriers[2] = {
+			CD3DX12_RESOURCE_BARRIER::Transition(srcResource, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_SOURCE),
+			CD3DX12_RESOURCE_BARRIER::Transition(dstResource, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)
+		};
+		commandLists[frameIndex]->ResourceBarrier(2, barriers);
+
+		commandLists[frameIndex]->CopyResource(dstResource, srcResource);
+
+		D3D12_RESOURCE_BARRIER postBarriers[2] = {
+			CD3DX12_RESOURCE_BARRIER::Transition(srcResource, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON),
+			CD3DX12_RESOURCE_BARRIER::Transition(dstResource, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)
+		};
+		commandLists[frameIndex]->ResourceBarrier(2, postBarriers);
+
+		if (usingNeuralDLSS) {
+			static bool loggedVisualOnce = false;
+			if (!loggedVisualOnce) {
+				REX::INFO("[DLSS-NR-VISUAL] Presenting Neural DLSS scene; UI will be composited after scene processing");
+				loggedVisualOnce = true;
+			}
+		}
 	}
 
 	DX::ThrowIfFailed(commandLists[frameIndex]->Close());

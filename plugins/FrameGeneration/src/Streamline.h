@@ -61,15 +61,21 @@ public:
 
 	void Shutdown();
 
-	// Experimental D3D12 DLAA dispatch used to make a real D3D12 DLSS evaluation
-	// visible to DLSS Neural Rendering/ReShade addons. The output is intentionally
-	// discarded in this first probe build; success is verified through addon/log counters.
+	// D3D12 DLAA dispatch used as the visual Neural Rendering scene pass.
+	// RenoDX hooks this DLSS evaluation and writes the processed scene into
+	// dlssProbeOutput; DX12SwapChain then presents that texture before UI composition.
 	bool RunDLSSProbe(
 		ID3D12GraphicsCommandList* a_cmdList,
 		ID3D12Resource* a_depth,
 		ID3D12Resource* a_motionVectors,
 		ID3D12Resource* a_color,
 		float2 a_screenSize);
+
+	// Valid only for the current frame after a successful RunDLSSProbe call.
+	ID3D12Resource* GetDLSSOutput() const
+	{
+		return dlssOutputValid ? dlssProbeOutput : nullptr;
+	}
 
 	bool slInitialized = false;
 	bool featureDLSSG = false;
@@ -100,6 +106,7 @@ public:
 	uint32_t dlssProbeWidth = 0;
 	uint32_t dlssProbeHeight = 0;
 	DXGI_FORMAT dlssProbeFormat = DXGI_FORMAT_UNKNOWN;
+	bool dlssOutputValid = false;
 
 	// DLSS-G function pointers
 	PFun_slDLSSGSetOptions* slDLSSGSetOptions{};
