@@ -1,3 +1,5 @@
+AI sloppening, (I'd recommend just using https://github.com/NIGos/dlss5-dx11-bridge )
+
 # FO4Upscaling
 
 [![Build](https://github.com/northaxosky/FO4Upscaling/actions/workflows/build.yml/badge.svg)](https://github.com/northaxosky/FO4Upscaling/actions/workflows/build.yml)
