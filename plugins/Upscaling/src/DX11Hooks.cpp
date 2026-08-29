@@ -42,27 +42,25 @@ struct hkD3D11CreateDeviceAndSwapChain
 
 		REX::INFO("[DX11] Device created successfully, feature level: 0x{:x}", static_cast<uint>(*pFeatureLevel));
 		if (pSwapChainDesc) {
-			REX::INFO("[DX11] SwapChain: {}x{}, format={}, bufferCount={}", pSwapChainDesc->BufferDesc.Width, pSwapChainDesc->BufferDesc.Height, static_cast<uint>(pSwapChainDesc->BufferDesc.Format), pSwapChainDesc->BufferCount);
+			REX::INFO("[DX11] SwapChain: {}x{}, format={}, bufferCount={}",
+				pSwapChainDesc->BufferDesc.Width,
+				pSwapChainDesc->BufferDesc.Height,
+				static_cast<uint>(pSwapChainDesc->BufferDesc.Format),
+				pSwapChainDesc->BufferCount);
 		}
 
+		// V7: Fallout's swap chain remains completely D3D11. Streamline owns only a
+		// sidecar D3D12 compute queue used for DLSS/Neural Rendering. Do NOT upgrade
+		// or replace the game's swap chain and do NOT pass the D3D11 device to
+		// slSetD3DDevice.
 		auto streamline = Streamline::GetSingleton();
-
-		if (streamline->interposer){
-			REX::INFO("[SL] Interposer present, initializing Streamline...");
-			streamline->Initialize();
-			if (!enbLoaded && !streamline->alreadyInitialized) {
-				REX::INFO("[SL] Upgrading swap chain interface (no ENB)");
-				streamline->slUpgradeInterface((void**)&(*ppSwapChain));
-			} else if (streamline->alreadyInitialized) {
-				REX::INFO("[SL] Skipping swap chain upgrade (FrameGen plugin owns Streamline)");
-			} else {
-				REX::INFO("[SL] Skipping swap chain upgrade (ENB loaded)");
+		if (streamline->interposer && !streamline->conflictDetected) {
+			REX::INFO("[DLSS-NR-V7] Initializing standalone D3D12 Streamline backend");
+			if (!streamline->InitializeD3D12(pAdapter, *ppDevice, *ppImmediateContext)) {
+				REX::WARN("[DLSS-NR-V7] D3D12 DLSS backend unavailable; normal FSR fallback remains available");
 			}
-			streamline->slSetD3DDevice(*ppDevice);
-			streamline->CheckFeatures(pAdapter);
-			streamline->PostDevice();
 		} else {
-			REX::INFO("[SL] No interposer loaded, Streamline disabled");
+			REX::WARN("[DLSS-NR-V7] Streamline D3D12 backend was not initialized");
 		}
 
 		return S_OK;
@@ -80,9 +78,12 @@ namespace DX11Hooks
 		uintptr_t moduleBase = (uintptr_t)GetModuleHandle(nullptr);
 		REX::INFO("[HOOK] Module base: {:#x}", moduleBase);
 
-		// Hook BSGraphics::CreateD3DAndSwapChain::D3D11CreateDeviceAndSwapChain to use D3D_FEATURE_LEVEL_11_1
 		REX::INFO("[HOOK] Installing IAT hook for D3D11CreateDeviceAndSwapChain");
-		(uintptr_t&)hkD3D11CreateDeviceAndSwapChain::func = Detours::IATHook(moduleBase, "d3d11.dll", "D3D11CreateDeviceAndSwapChain", (uintptr_t)hkD3D11CreateDeviceAndSwapChain::thunk);
+		(uintptr_t&)hkD3D11CreateDeviceAndSwapChain::func = Detours::IATHook(
+			moduleBase,
+			"d3d11.dll",
+			"D3D11CreateDeviceAndSwapChain",
+			(uintptr_t)hkD3D11CreateDeviceAndSwapChain::thunk);
 		REX::INFO("[HOOK] IAT hook installed, original func: {:#x}", (uintptr_t)hkD3D11CreateDeviceAndSwapChain::func.get());
 	}
 }

@@ -8,182 +8,181 @@
 #include <sl_consts.h>
 #include <sl_dlss.h>
 #include <sl_matrix_helpers.h>
-#include <sl_nis.h>
 #include <sl_version.h>
 #pragma warning(pop)
+
 #include "Buffer.h"
 
-using PFun_slSetTag2 = sl::Result(const sl::ViewportHandle& viewport, const sl::ResourceTag* tags, uint32_t numTags, sl::CommandBuffer* cmdBuffer);
+#include <array>
+#include <climits>
+#include <d3d11_4.h>
+#include <d3d12.h>
+#include <dxgi1_6.h>
+#include <string>
+#include <winrt/base.h>
+
+using PFun_slSetTagForFrame2 = sl::Result(
+	const sl::FrameToken& frame,
+	const sl::ViewportHandle& viewport,
+	const sl::ResourceTag* tags,
+	uint32_t numTags,
+	sl::CommandBuffer* cmdBuffer);
 
 /**
  * @class Streamline
- * @brief Manager for NVIDIA Streamline integration and DLSS upscaling
+ * @brief D3D12 Streamline/DLSS backend used by the D3D11 Fallout renderer.
  *
- * Handles initialization of NVIDIA Streamline SDK, feature detection,
- * and execution of DLSS (Deep Learning Super Sampling) upscaling.
- * Uses manual hooking mode to integrate with Fallout 4's rendering pipeline.
+ * Fallout still renders with D3D11/DXVK. This backend creates a sidecar D3D12
+ * device on the same adapter, copies the game's genuine low-resolution color,
+ * depth and motion-vector inputs into shared D3D11/D3D12 textures, evaluates
+ * DLSS on D3D12, and copies the full-resolution result back to D3D11 before the
+ * game renders its UI. RenoDX can therefore intercept the real D3D12 DLSS call
+ * and replace/augment it with Neural Rendering without owning presentation.
  */
 class Streamline
 {
 public:
-	// ========================================
-	// Singleton & Lifecycle
-	// ========================================
-
-	/**
-	 * @brief Get the singleton instance
-	 * @return Pointer to the global Streamline instance
-	 */
 	static Streamline* GetSingleton()
 	{
 		static Streamline singleton;
 		return &singleton;
 	}
 
-	/**
-	 * @brief Destructor - frees Streamline interposer DLL
-	 *
-	 * Ensures proper cleanup of the loaded interposer library
-	 */
-	~Streamline()
-	{
-		if (interposer) {
-			FreeLibrary(interposer);
-			interposer = nullptr;
-		}
-	}
+	~Streamline();
 
-	/**
-	 * @brief Get short name for logging
-	 * @return "Streamline"
-	 */
-	inline std::string GetShortName() { return "Streamline"; }
+	inline std::string GetShortName() { return "Streamline-D3D12"; }
 
-	// ========================================
-	// Initialization
-	// ========================================
-
-	/**
-	 * @brief Load Streamline interposer DLL
-	 *
-	 * Loads sl.interposer.dll from Data/F4SE/Plugins/Upscaling/Streamline/
-	 * The interposer provides the Streamline SDK interface.
-	 */
+	// Load the Streamline interposer. AAAFrameGeneration.dll must be disabled for
+	// this backend because Streamline has process-global initialization state.
 	void LoadInterposer();
 
-	/**
-	 * @brief Initialize Streamline SDK
-	 *
-	 * Sets up Streamline preferences, initializes the SDK, and queries for
-	 * available features (DLSS). Uses manual hooking mode to integrate with
-	 * the game's D3D11 device.
-	 */
-	void Initialize();
+	// Initialize Streamline as D3D12 and create the D3D11<->D3D12 sidecar bridge.
+	bool InitializeD3D12(IDXGIAdapter* a_adapter, ID3D11Device* a_d3d11Device, ID3D11DeviceContext* a_d3d11Context);
 
-	/**
-	 * @brief Check Streamline plugin compat
-	 */
-	void CheckFeatures(IDXGIAdapter* a_adapte);
+	// Query NVIDIA's recommended render scale for the selected DLSS mode. Falls
+	// back to 0.0f when no valid recommendation is available.
+	float GetResolutionScale(uint a_qualityMode, uint a_outputWidth, uint a_outputHeight);
 
-	/**
-	 * @brief Initialise features after device
-	 */
-	void PostDevice();
+	// Evaluate D3D12 DLSS using the low-resolution portion rendered by Fallout.
+	// The output is copied back into a_upscaleTexture before returning to the
+	// normal Upscaling.cpp path, so Fallout's UI remains native and untouched.
+	void Upscale(Texture2D* a_upscaleTexture,
+		Texture2D* a_dilatedMotionVectorTexture,
+		float2 a_jitter,
+		float2 a_renderSize,
+		uint a_qualityMode);
 
-	/**
-	 * @brief Create D3D11 device and swap chain with Streamline integration
-	 * @param pAdapter GPU adapter to use
-	 * @param DriverType Driver type
-	 * @param Software Software rasterizer module (if applicable)
-	 * @param Flags Device creation flags
-	 * @param pFeatureLevels Array of feature levels to try
-	 * @param FeatureLevels Number of feature levels
-	 * @param SDKVersion D3D11 SDK version
-	 * @param pSwapChainDesc Swap chain description
-	 * @param ppSwapChain Output swap chain pointer
-	 * @param ppDevice Output device pointer
-	 * @param pFeatureLevel Output feature level
-	 * @param ppImmediateContext Output device context pointer
-	 * @return HRESULT indicating success or failure
-	 *
-	 * Wraps D3D11CreateDeviceAndSwapChain to inject Streamline initialization
-	 * and feature detection. Checks for DLSS availability on the current GPU.
-	 */
-	HRESULT CreateDeviceAndSwapChain(IDXGIAdapter* pAdapter, D3D_DRIVER_TYPE DriverType, HMODULE Software, UINT Flags, const D3D_FEATURE_LEVEL* pFeatureLevels, UINT FeatureLevels, UINT SDKVersion, const DXGI_SWAP_CHAIN_DESC* pSwapChainDesc, IDXGISwapChain** ppSwapChain, ID3D11Device** ppDevice, D3D_FEATURE_LEVEL* pFeatureLevel, ID3D11DeviceContext** ppImmediateContext);
+	// Force a temporal-history reset on the next DLSS evaluation.
+	void RequestReset(const char* a_reason);
 
-	// ========================================
-	// DLSS Operations
-	// ========================================
-
-	/**
-	 * @brief Execute DLSS upscaling
-	 * @param a_color Input/output color texture at render resolution
-	 * @param a_dilatedMotionVectorTexture Dilated motion vectors for better temporal stability
-	 * @param a_jitter Camera jitter offset for current frame
-	 * @param a_renderSize Render resolution dimensions
-	 * @param a_qualityMode DLSS quality mode (0=DLAA, 1=Quality, 2=Balanced, 3=Performance, 4=Ultra Performance)
-	 *
-	 * Performs DLSS upscaling from render resolution to display resolution.
-	 * Uses dilated motion vectors and depth buffer for temporal reconstruction.
-	 * The upscaled result is written back to a_color texture.
-	 */
-	void Upscale(Texture2D* a_color, Texture2D* a_dilatedMotionVectorTexture, float2 a_jitter, float2 a_renderSize, uint a_qualityMode);
-
-	/**
-	 * @brief Update Streamline constants for current frame
-	 * @param a_jitter Camera jitter offset
-	 *
-	 * Sets frame-specific constants like jitter offset, motion vector scale,
-	 * and camera parameters. Must be called before Upscale().
-	 */
-	void UpdateConstants(float2 a_jitter);
-
-	/**
-	 * @brief Destroy DLSS resources and disable DLSS
-	 *
-	 * Disables DLSS mode and frees Streamline resources for the current viewport.
-	 * Called when switching to a different upscaling method.
-	 */
+	// Disable DLSS and release both Streamline and interop resources.
 	void DestroyDLSSResources();
+	void Shutdown();
 
-	// ========================================
-	// State
-	// ========================================
+	bool initialized = false;
+	bool featureDLSS = false;
+	bool conflictDetected = false;
 
-	bool initialized = false;       ///< True if Streamline SDK is initialized
-	bool alreadyInitialized = false; ///< True if another plugin already called slInit
-	bool featureDLSS = false;       ///< True if DLSS is available on current GPU
+	// Streamline state
+	sl::ViewportHandle viewport{ 0 };
+	sl::FrameToken* frameToken = nullptr;
+	HMODULE interposer = nullptr;
 
-	sl::ViewportHandle viewport{ 0 };  ///< Streamline viewport handle
-	sl::FrameToken* frameToken = nullptr;  ///< Current frame token for Streamline
+private:
+	static constexpr uint32_t kFramesInFlight = 3;
 
-	HMODULE interposer = NULL;  ///< Handle to sl.interposer.dll
+	struct SharedTexture
+	{
+		winrt::com_ptr<ID3D11Texture2D> resource11;
+		winrt::com_ptr<ID3D12Resource> resource12;
+		D3D11_TEXTURE2D_DESC desc{};
 
-	// ========================================
-	// SL Interposer Function Pointers
-	// ========================================
+		void Reset()
+		{
+			resource12 = nullptr;
+			resource11 = nullptr;
+			desc = {};
+		}
+	};
 
-	// Core Functions
-	PFun_slInit* slInit{};                                  ///< Initialize Streamline
-	PFun_slShutdown* slShutdown{};                          ///< Shutdown Streamline
-	PFun_slIsFeatureSupported* slIsFeatureSupported{};      ///< Check if feature is supported
-	PFun_slIsFeatureLoaded* slIsFeatureLoaded{};            ///< Check if feature is loaded
-	PFun_slSetFeatureLoaded* slSetFeatureLoaded{};          ///< Set feature loaded state
-	PFun_slEvaluateFeature* slEvaluateFeature{};            ///< Execute feature (e.g., DLSS)
-	PFun_slAllocateResources* slAllocateResources{};        ///< Allocate feature resources
-	PFun_slFreeResources* slFreeResources{};                ///< Free feature resources
-	PFun_slSetTag2* slSetTag{};                             ///< Tag resources for Streamline
-	PFun_slGetFeatureRequirements* slGetFeatureRequirements{};  ///< Get feature requirements
-	PFun_slGetFeatureVersion* slGetFeatureVersion{};        ///< Get feature version
-	PFun_slUpgradeInterface* slUpgradeInterface{};          ///< Upgrade interface version
-	PFun_slSetConstants* slSetConstants{};                  ///< Set frame constants
-	PFun_slGetNativeInterface* slGetNativeInterface{};      ///< Get native interface
-	PFun_slGetFeatureFunction* slGetFeatureFunction{};      ///< Get feature-specific function
-	PFun_slGetNewFrameToken* slGetNewFrameToken{};          ///< Get new frame token
-	PFun_slSetD3DDevice* slSetD3DDevice{};                  ///< Set D3D11 device
+	bool ResolveFunctions();
+	bool CreateD3D12Bridge(IDXGIAdapter* a_adapter, ID3D11Device* a_d3d11Device, ID3D11DeviceContext* a_d3d11Context);
+	bool CreateSharedTexture(SharedTexture& a_texture, uint32_t a_width, uint32_t a_height, DXGI_FORMAT a_format, UINT a_bindFlags);
+	bool EnsureInteropResources(uint32_t a_renderWidth, uint32_t a_renderHeight, uint32_t a_outputWidth, uint32_t a_outputHeight, DXGI_FORMAT a_colorFormat);
+	bool ConfigureDLSS(uint a_qualityMode, uint32_t a_outputWidth, uint32_t a_outputHeight);
+	bool UpdateConstants(float2 a_jitter, float2 a_renderSize, bool a_forceReset);
+	bool WaitForAllocator(uint32_t a_slot);
+	void WaitForD3D12Idle();
+	void ReleaseInteropResources();
+	static sl::DLSSMode ToDLSSMode(uint a_qualityMode);
 
-	// DLSS Specific Functions
-	PFun_slDLSSGetOptimalSettings* slDLSSGetOptimalSettings{};  ///< Get optimal DLSS settings
-	PFun_slDLSSGetState* slDLSSGetState{};                      ///< Get DLSS state
-	PFun_slDLSSSetOptions* slDLSSSetOptions{};                  ///< Set DLSS options
+	// D3D11 side of the bridge
+	winrt::com_ptr<ID3D11Device5> d3d11Device;
+	winrt::com_ptr<ID3D11DeviceContext4> d3d11Context;
+	winrt::com_ptr<ID3D11Fence> d3d11Fence;
+
+	// D3D12 side of the bridge
+	winrt::com_ptr<ID3D12Device> d3d12Device;
+	winrt::com_ptr<ID3D12CommandQueue> commandQueue;
+	std::array<winrt::com_ptr<ID3D12CommandAllocator>, kFramesInFlight> commandAllocators;
+	winrt::com_ptr<ID3D12GraphicsCommandList> commandList;
+	winrt::com_ptr<ID3D12Fence> d3d12Fence;
+	std::array<uint64_t, kFramesInFlight> allocatorFenceValues{};
+	HANDLE fenceEvent = nullptr;
+	uint64_t fenceValue = 0;
+	uint32_t frameSlot = 0;
+
+	SharedTexture colorInput;
+	SharedTexture depthInput;
+	SharedTexture motionVectorInput;
+	SharedTexture upscaleOutput;
+	uint32_t interopRenderWidth = 0;
+	uint32_t interopRenderHeight = 0;
+	uint32_t interopOutputWidth = 0;
+	uint32_t interopOutputHeight = 0;
+	DXGI_FORMAT interopColorFormat = DXGI_FORMAT_UNKNOWN;
+
+	bool dlssOptionsConfigured = false;
+	uint configuredQualityMode = UINT_MAX;
+	uint32_t configuredOutputWidth = 0;
+	uint32_t configuredOutputHeight = 0;
+
+	bool resetRequested = true;
+	std::string resetReason = "first frame";
+	uint64_t lastDLSSFrame = UINT64_MAX;
+	float lastCameraX = 0.0f;
+	float lastCameraY = 0.0f;
+	float lastCameraZ = 0.0f;
+	float lastCameraFov = 0.0f;
+	bool havePreviousCamera = false;
+
+	// Cached NVIDIA optimal-settings query
+	uint cachedOptimalQuality = UINT_MAX;
+	uint32_t cachedOptimalOutputWidth = 0;
+	uint32_t cachedOptimalOutputHeight = 0;
+	uint32_t cachedOptimalRenderWidth = 0;
+	uint32_t cachedOptimalRenderHeight = 0;
+
+	bool ownsInterposer = false;
+
+	// Core Streamline function pointers
+	PFun_slInit* slInit{};
+	PFun_slShutdown* slShutdown{};
+	PFun_slIsFeatureSupported* slIsFeatureSupported{};
+	PFun_slIsFeatureLoaded* slIsFeatureLoaded{};
+	PFun_slEvaluateFeature* slEvaluateFeature{};
+	PFun_slAllocateResources* slAllocateResources{};
+	PFun_slFreeResources* slFreeResources{};
+	PFun_slGetFeatureRequirements* slGetFeatureRequirements{};
+	PFun_slGetFeatureVersion* slGetFeatureVersion{};
+	PFun_slSetConstants* slSetConstants{};
+	PFun_slGetFeatureFunction* slGetFeatureFunction{};
+	PFun_slGetNewFrameToken* slGetNewFrameToken{};
+	PFun_slSetD3DDevice* slSetD3DDevice{};
+	PFun_slSetTagForFrame2* slSetTagForFrame{};
+
+	// DLSS feature functions
+	PFun_slDLSSGetOptimalSettings* slDLSSGetOptimalSettings{};
+	PFun_slDLSSGetState* slDLSSGetState{};
+	PFun_slDLSSSetOptions* slDLSSSetOptions{};
 };

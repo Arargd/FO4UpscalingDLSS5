@@ -392,11 +392,21 @@ void Upscaling::OnDataLoaded()
 
 RE::BSEventNotifyControl Upscaling::ProcessEvent(const RE::MenuOpenCloseEvent& a_event, RE::BSTEventSource<RE::MenuOpenCloseEvent>*)
 {
-	// Reload settings when closing MCM menu
-	if (a_event.menuName == "PauseMenu") {
-		if (!a_event.opening) {
-			GetSingleton()->LoadSettings();
-		}
+	// Reload settings when closing the pause/MCM menu.
+	if (a_event.menuName == "PauseMenu" && !a_event.opening) {
+		GetSingleton()->LoadSettings();
+	}
+
+	// Temporal upscalers must discard history across menus/loading states where
+	// the normal game frame stream is interrupted or camera state can jump.
+	if (a_event.menuName == "PauseMenu" ||
+		a_event.menuName == "ExamineMenu" ||
+		a_event.menuName == "PipboyMenu" ||
+		a_event.menuName == "LoadingMenu" ||
+		a_event.menuName == "TerminalMenu" ||
+		a_event.menuName == "ContainerMenu" ||
+		a_event.menuName == "BarterMenu") {
+		Streamline::GetSingleton()->RequestReset(a_event.opening ? "menu opened" : "menu closed");
 	}
 
 	return RE::BSEventNotifyControl::kContinue;
@@ -608,11 +618,10 @@ void Upscaling::UpdateRenderTargets(float a_currentWidthRatio, float a_currentHe
 	upscalingTexture->CreateSRV(srvDesc);
 	upscalingTexture->CreateUAV(uavDesc);
 
-	// Do not need to replace render targets at native resolution
-	if (a_currentWidthRatio == 1.0f && a_currentHeightRatio == 1.0f)
-		return;
-
-	// Dynamic resolution depth texture (R32 float)
+	// Always create an R32_FLOAT depth copy at the active render resolution.
+	// The integrated D3D12 DLSS backend uses this as a shareable depth input in
+	// both sub-native modes and native DLAA. Proxy render targets themselves are
+	// still skipped at native resolution by UpdateRenderTarget().
 	texDesc.Width = static_cast<uint>(static_cast<float>(texDesc.Width) * a_currentWidthRatio);
 	texDesc.Height = static_cast<uint>(static_cast<float>(texDesc.Height) * a_currentHeightRatio);
 
@@ -847,6 +856,25 @@ void Upscaling::CopyDepth()
 	static auto rendererData = RE::BSGraphics::GetRendererData();
 	auto context = reinterpret_cast<ID3D11DeviceContext*>(rendererData->context);
 
+	// Copy at most once per game frame. Several post-processing hooks can request
+	// the full-resolution/decomposed depth copy, and the DLSS backend also needs it
+	// immediately before evaluation.
+	static auto gameViewportForFrame = Util::State_GetSingleton();
+	static uint64_t lastCopiedFrame = UINT64_MAX;
+	static ID3D11Texture2D* lastCopiedTarget = nullptr;
+	const uint64_t currentFrame = static_cast<uint64_t>(gameViewportForFrame->frameCount);
+
+	if (!depthOverrideTexture || !depthOverrideTexture->uav) {
+		REX::ERROR("[DEPTH] depthOverrideTexture unavailable during CopyDepth");
+		return;
+	}
+
+	auto currentDepthTarget = depthOverrideTexture->resource.get();
+	if (lastCopiedFrame == currentFrame && lastCopiedTarget == currentDepthTarget)
+		return;
+	lastCopiedFrame = currentFrame;
+	lastCopiedTarget = currentDepthTarget;
+
 	// Unbind all render targets before we start manipulating textures
 	// This ensures we don't have any resource hazards during the copy
 	context->OMSetRenderTargets(0, nullptr, nullptr);
@@ -934,7 +962,8 @@ Upscaling::UpscaleMethod Upscaling::GetUpscaleMethod(bool a_checkMenu)
 
 	// Disable the upscaling method when certain menus are open
 	if (a_checkMenu){
-		if (ui->GetMenuOpen("ExamineMenu")
+		if (ui->GetMenuOpen("PauseMenu")
+			|| ui->GetMenuOpen("ExamineMenu")
 			|| ui->GetMenuOpen("PipboyMenu")
 			|| ui->GetMenuOpen("LoadingMenu")
 			|| ui->GetMenuOpen("TerminalMenu")
@@ -1111,16 +1140,31 @@ void Upscaling::UpdateUpscaling()
 	upscaleMethodNoMenu = GetUpscaleMethod(false);
 	upscaleMethod = GetUpscaleMethod(true);
 
-	// Calculate render resolution scale from quality mode
-	// Example: Quality mode returns upscale ratio of ~1.5x, so resolutionScale = 1/1.5 = 0.67
+	// Calculate render resolution scale from the active upscaler. For DLSS, use
+	// NVIDIA's own optimal-settings query instead of borrowing FSR's ratios. This
+	// guarantees that the D3D12 resources and tagged extents match the mode DLSS
+	// actually expects (for example ~1280x720 -> 1920x1080 in Quality mode).
 	auto effectiveQuality = GetEffectiveQualityMode();
-	float resolutionScale = upscaleMethodNoMenu == UpscaleMethod::kDisabled ? 1.0f : 1.0f / ffxFsr3GetUpscaleRatioFromQualityMode((FfxFsr3QualityMode)effectiveQuality);
+	float resolutionScale = 1.0f;
+	if (upscaleMethodNoMenu != UpscaleMethod::kDisabled) {
+		if (upscaleMethodNoMenu == UpscaleMethod::kDLSS) {
+			auto streamline = Streamline::GetSingleton();
+			resolutionScale = streamline->GetResolutionScale(effectiveQuality, gameViewport->screenWidth, gameViewport->screenHeight);
+			if (resolutionScale <= 0.0f) {
+				resolutionScale = 1.0f / ffxFsr3GetUpscaleRatioFromQualityMode((FfxFsr3QualityMode)effectiveQuality);
+				REX::WARN("[RES] DLSS optimal-settings query unavailable; using compatibility scale {:.4f}", resolutionScale);
+			}
+		} else {
+			resolutionScale = 1.0f / ffxFsr3GetUpscaleRatioFromQualityMode((FfxFsr3QualityMode)effectiveQuality);
+		}
+	}
 
 	{
 		static float previousResolutionScale = -1.0f;
 		if (previousResolutionScale != resolutionScale) {
 			REX::INFO("[RES] Resolution scale changed: {:.4f} -> {:.4f} (qualityMode={}, enbLoaded={}, method={})",
 				previousResolutionScale, resolutionScale, settings.qualityMode, enbLoaded, static_cast<uint>(upscaleMethodNoMenu));
+			Streamline::GetSingleton()->RequestReset("render resolution changed");
 			previousResolutionScale = resolutionScale;
 		}
 	}
@@ -1211,8 +1255,10 @@ void Upscaling::Upscale()
 		loggedOnce = true;
 	}
 
-	// DLSS: Dilate motion vectors for better temporal stability
+	// DLSS: refresh the shareable R32 depth input and dilate motion vectors for
+	// temporal stability before handing the frame to the D3D12 backend.
 	if (upscaleMethod == UpscaleMethod::kDLSS){
+		CopyDepth();
 		{
 			UpdateAndBindUpscalingCB(context, screenSize, renderSize);
 
