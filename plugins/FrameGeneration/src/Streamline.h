@@ -8,6 +8,7 @@
 #pragma warning(disable: 4471)
 #include <sl.h>
 #include <sl_consts.h>
+#include <sl_dlss.h>
 #include <sl_dlss_g.h>
 #include <sl_matrix_helpers.h>
 #include <sl_reflex.h>
@@ -29,6 +30,7 @@ public:
 	bool InitStreamline();
 	void SetD3DDevice(ID3D12Device* a_device);
 	bool CheckAndEnableDLSSG();
+	bool CheckAndEnableDLSSProbe();
 	void SetEnabled(bool a_enabled);
 
 	void AcquireFrameToken();
@@ -59,8 +61,20 @@ public:
 
 	void Shutdown();
 
+	// Experimental D3D12 DLAA dispatch used to make a real D3D12 DLSS evaluation
+	// visible to DLSS Neural Rendering/ReShade addons. The output is intentionally
+	// discarded in this first probe build; success is verified through addon/log counters.
+	bool RunDLSSProbe(
+		ID3D12GraphicsCommandList* a_cmdList,
+		ID3D12Resource* a_depth,
+		ID3D12Resource* a_motionVectors,
+		ID3D12Resource* a_color,
+		float2 a_screenSize);
+
 	bool slInitialized = false;
 	bool featureDLSSG = false;
+	bool featureDLSS = false;
+	bool dlssProbeEnabled = true;
 	uint32_t configuredFrameCount = 1;
 	ID3D12Device* d3d12Device = nullptr;
 	HMODULE interposer = nullptr;
@@ -76,6 +90,16 @@ public:
 	PFun_slSetTagForFrame2* slSetTagForFrame{};
 	PFun_slSetConstants* slSetConstants{};
 	PFun_slGetNewFrameToken* slGetNewFrameToken{};
+	PFun_slEvaluateFeature* slEvaluateFeature{};
+
+	// DLSS Super Resolution / DLAA function pointers
+	PFun_slDLSSSetOptions* slDLSSSetOptions{};
+
+	// Scratch D3D12 output for the probe dispatch
+	ID3D12Resource* dlssProbeOutput = nullptr;
+	uint32_t dlssProbeWidth = 0;
+	uint32_t dlssProbeHeight = 0;
+	DXGI_FORMAT dlssProbeFormat = DXGI_FORMAT_UNKNOWN;
 
 	// DLSS-G function pointers
 	PFun_slDLSSGSetOptions* slDLSSGSetOptions{};
