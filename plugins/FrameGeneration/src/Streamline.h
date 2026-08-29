@@ -64,6 +64,8 @@ public:
 	// D3D12 DLAA dispatch used as the visual Neural Rendering scene pass.
 	// RenoDX hooks this DLSS evaluation and writes the processed scene into
 	// dlssProbeOutput; DX12SwapChain then presents that texture before UI composition.
+	// V4.1 deliberately keeps input/output at native size until a real low-resolution
+	// source resource exists; tagging a sub-extent is cropping, not downsampling.
 	bool RunDLSSProbe(
 		ID3D12GraphicsCommandList* a_cmdList,
 		ID3D12Resource* a_depth,
@@ -101,12 +103,18 @@ public:
 	// DLSS Super Resolution / DLAA function pointers
 	PFun_slDLSSSetOptions* slDLSSSetOptions{};
 
-	// Scratch D3D12 output for the probe dispatch
+	// Scratch D3D12 output for the visual DLSS/NR dispatch.
 	ID3D12Resource* dlssProbeOutput = nullptr;
 	uint32_t dlssProbeWidth = 0;
 	uint32_t dlssProbeHeight = 0;
 	DXGI_FORMAT dlssProbeFormat = DXGI_FORMAT_UNKNOWN;
 	bool dlssOutputValid = false;
+
+	// Cache DLSS options. Re-applying slDLSSSetOptions every frame makes the
+	// generic NR addon rebuild feature 18 repeatedly, which is extremely costly.
+	bool dlssOptionsConfigured = false;
+	uint32_t dlssConfiguredOutputWidth = 0;
+	uint32_t dlssConfiguredOutputHeight = 0;
 
 	// DLSS-G function pointers
 	PFun_slDLSSGSetOptions* slDLSSGSetOptions{};

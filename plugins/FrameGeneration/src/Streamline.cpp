@@ -276,24 +276,74 @@ bool StreamlineFG::RunDLSSProbe(
 		REX::INFO("[DLSS-NR-PROBE] Scratch output created: {}x{}, format={}", width, height, (int)inputDesc.Format);
 	}
 
-	// IMPORTANT FOR THE NR ADDON:
-	// Tag the DLSS resources BEFORE slDLSSSetOptions. The experimental RenoDX
-	// NR addon observes DLSS setup/evaluation and looks the resources up through
-	// Streamline's global frame tags. In the first probe we called SetOptions
-	// first, which caused Streamline to report that ScalingInputColor was missing.
-	// Keep input/output alive through present as well so a post-DLSS addon can
-	// safely consume both textures after the game's DLSS evaluation.
-	sl::Extent extent{ 0, 0, width, height };
+	// V4.1 correctness pass: keep the DLSS input extent equal to the actual
+	// source texture extent. Merely tagging the top-left 1280x720 region of a
+	// 1920x1080 texture does NOT downsample the frame; it crops it. A genuine
+	// Quality-mode 1280x720 -> 1920x1080 path needs a real 1280x720 source
+	// resource (or a game render target that is actually 1280x720).
+	//
+	// For now use native-resolution DLAA/Neural Rendering so every tagged pixel
+	// corresponds to real source data. This makes the visual path correct first;
+	// a real low-resolution input path can be added separately.
+	const uint32_t renderWidth = width;
+	const uint32_t renderHeight = height;
+
+	// Log the real resource dimensions once (and whenever they change). This is
+	// important because the swap-chain size alone does not prove that the scene,
+	// depth and motion-vector resources have matching dimensions.
+	auto depthDesc = a_depth->GetDesc();
+	auto mvecDesc = a_motionVectors->GetDesc();
+	static uint32_t loggedColorW = 0, loggedColorH = 0;
+	static uint32_t loggedDepthW = 0, loggedDepthH = 0;
+	static uint32_t loggedMvecW = 0, loggedMvecH = 0;
+	if (loggedColorW != inputDesc.Width || loggedColorH != inputDesc.Height ||
+		loggedDepthW != depthDesc.Width || loggedDepthH != depthDesc.Height ||
+		loggedMvecW != mvecDesc.Width || loggedMvecH != mvecDesc.Height)
+	{
+		REX::INFO(
+			"[DLSS-NR-V4.1] Resource sizes: color={}x{} depth={}x{} mvec={}x{} requested={}x{}",
+			(uint32_t)inputDesc.Width, inputDesc.Height,
+			(uint32_t)depthDesc.Width, depthDesc.Height,
+			(uint32_t)mvecDesc.Width, mvecDesc.Height,
+			width, height);
+		loggedColorW = (uint32_t)inputDesc.Width;
+		loggedColorH = inputDesc.Height;
+		loggedDepthW = (uint32_t)depthDesc.Width;
+		loggedDepthH = depthDesc.Height;
+		loggedMvecW = (uint32_t)mvecDesc.Width;
+		loggedMvecH = mvecDesc.Height;
+	}
+
+	// Refuse to feed DLSS an extent larger than the backing resources. This avoids
+	// undefined reads and the classic "only the top-left part looks valid" failure.
+	if (inputDesc.Width < width || inputDesc.Height < height ||
+		depthDesc.Width < width || depthDesc.Height < height ||
+		mvecDesc.Width < width || mvecDesc.Height < height)
+	{
+		static bool loggedSizeMismatch = false;
+		if (!loggedSizeMismatch) {
+			REX::ERROR(
+				"[DLSS-NR-V4.1] Resource-size mismatch; skipping visual DLSS instead of presenting a partial frame");
+			loggedSizeMismatch = true;
+		}
+		return false;
+	}
+
+	// DLSS required tags are needed through Evaluate, not through Present. Keeping
+	// them scoped to Evaluate prevents stale scaling tags from leaking into the
+	// later DLSS-G/UI tagging in the same frame.
+	sl::Extent inputExtent{ 0, 0, renderWidth, renderHeight };
+	sl::Extent fullExtent{ 0, 0, width, height };
 	sl::Resource colorIn = { sl::ResourceType::eTex2d, a_color, 0 };
 	sl::Resource colorOut = { sl::ResourceType::eTex2d, dlssProbeOutput, 0 };
 	sl::Resource depth = { sl::ResourceType::eTex2d, a_depth, 0 };
 	sl::Resource mvec = { sl::ResourceType::eTex2d, a_motionVectors, 0 };
 
 	sl::ResourceTag tags[] = {
-		{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilPresent, &extent },
-		{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilPresent, &extent },
-		{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilPresent, &extent },
-		{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilPresent, &extent },
+		{ &colorIn, sl::kBufferTypeScalingInputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &inputExtent },
+		{ &colorOut, sl::kBufferTypeScalingOutputColor, sl::ResourceLifecycle::eValidUntilEvaluate, &fullExtent },
+		{ &depth, sl::kBufferTypeDepth, sl::ResourceLifecycle::eValidUntilEvaluate, &inputExtent },
+		{ &mvec, sl::kBufferTypeMotionVectors, sl::ResourceLifecycle::eValidUntilEvaluate, &inputExtent },
 	};
 
 	if (slSetTagForFrame) {
@@ -308,18 +358,26 @@ bool StreamlineFG::RunDLSSProbe(
 		}
 	}
 
-	sl::DLSSOptions options{};
-	options.mode = sl::DLSSMode::eDLAA;
-	options.outputWidth = width;
-	options.outputHeight = height;
-	options.colorBuffersHDR = sl::Boolean::eFalse;
-	if (SL_FAILED(setResult, slDLSSSetOptions(viewport, options))) {
-		static bool loggedSetFailure = false;
-		if (!loggedSetFailure) {
-			REX::ERROR("[DLSS-NR-PROBE] slDLSSSetOptions failed: {}", (int)setResult);
-			loggedSetFailure = true;
+	// Configure DLSS only when the output resolution changes. V3 called
+	// slDLSSSetOptions every frame, which correlated with RenoDX rebuilding
+	// feature 18 repeatedly and causing the severe frame-rate collapse.
+	if (!dlssOptionsConfigured || dlssConfiguredOutputWidth != width || dlssConfiguredOutputHeight != height) {
+		sl::DLSSOptions options{};
+		options.mode = sl::DLSSMode::eDLAA;
+		options.outputWidth = width;
+		options.outputHeight = height;
+		options.colorBuffersHDR = sl::Boolean::eFalse;
+		if (SL_FAILED(setResult, slDLSSSetOptions(viewport, options))) {
+			REX::ERROR("[DLSS-NR-V4.1] slDLSSSetOptions failed: {}", (int)setResult);
+			dlssOptionsConfigured = false;
+			return false;
 		}
-		return false;
+
+		dlssOptionsConfigured = true;
+		dlssConfiguredOutputWidth = width;
+		dlssConfiguredOutputHeight = height;
+		REX::INFO("[DLSS-NR-V4.1] Native DLAA configured once: {}x{} -> {}x{}",
+			renderWidth, renderHeight, width, height);
 	}
 
 	sl::ViewportHandle view(viewport);
@@ -354,7 +412,7 @@ void StreamlineFG::Present(
 	float a_cameraNear, float a_cameraFar,
 	const CameraData& a_camera)
 {
-	if (!featureDLSSG || !frameToken) return;
+	if ((!featureDLSSG && !featureDLSS) || !frameToken) return;
 
 	// Set per-frame constants — matrices MUST be unjittered per DLSS-G docs
 	if (slSetConstants) {
@@ -431,7 +489,7 @@ void StreamlineFG::Present(
 		}
 	}
 
-	// Visual D3D12 DLAA dispatch. RenoDX hooks this evaluation and the resulting
+	// Visual D3D12 DLSS Quality dispatch. RenoDX hooks this evaluation and the resulting
 	// texture is copied to the swap chain later in DX12SwapChain::Present.
 	RunDLSSProbe(a_cmdList, a_depth, a_motionVectors, a_hudlessColor, a_screenSize);
 }
@@ -439,6 +497,9 @@ void StreamlineFG::Present(
 void StreamlineFG::Shutdown()
 {
 	dlssOutputValid = false;
+	dlssOptionsConfigured = false;
+	dlssConfiguredOutputWidth = 0;
+	dlssConfiguredOutputHeight = 0;
 
 	if (dlssProbeOutput) {
 		dlssProbeOutput->Release();
